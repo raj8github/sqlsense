@@ -29,7 +29,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         blocked_tables=args.block_table or [],
     )
 
-    print(f"🛡️  SQLSense v0.1.2 starting...", file=sys.stderr)
+    print(f"🛡️  SQLSense v0.1.3 starting...", file=sys.stderr)
     print(f"   DSN        : {_mask_dsn(args.dsn)}", file=sys.stderr)
     print(f"   Mode       : {'read-write' if args.allow_writes else 'readonly'}", file=sys.stderr)
     print(f"   Max rows   : {args.max_rows}", file=sys.stderr)
