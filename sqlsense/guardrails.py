@@ -9,7 +9,6 @@ is simply not acceptable.
 from __future__ import annotations
 
 import re
-import time
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,9 +17,9 @@ from typing import Optional
 # ─── Risk Levels ─────────────────────────────────────────────────────────────
 
 class RiskLevel(str, Enum):
-    LOW    = "low"       # SELECT with filter — green
-    MEDIUM = "medium"    # SELECT without filter, or aggregate over full table
-    HIGH   = "high"      # DDL, TRUNCATE, multi-table write
+    LOW     = "low"      # SELECT with filter — green
+    MEDIUM  = "medium"   # SELECT without filter, or aggregate over full table
+    HIGH    = "high"     # DDL, TRUNCATE, multi-table write
     BLOCKED = "blocked"  # DROP, DELETE without WHERE, raw data export
 
 
@@ -31,7 +30,7 @@ class GuardrailResult:
     allowed: bool
     risk: RiskLevel
     reason: str
-    rewritten_sql: Optional[str] = None   # SQL after safe rewrites applied
+    rewritten_sql: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
     estimated_rows: Optional[int] = None
     query_hash: str = ""
@@ -57,7 +56,7 @@ class GuardrailConfig:
     All defaults are deliberately conservative.
     """
     max_rows: int = 1000
-    max_query_cost_ms: int = 5000        # wall-clock budget in ms (advisory)
+    max_query_cost_ms: int = 5000
     allow_ddl: bool = False
     allow_delete: bool = False
     allow_update: bool = False
@@ -69,26 +68,25 @@ class GuardrailConfig:
         "api_key", "ssn", "credit_card", "card_number",
         "cvv", "private_key",
     ])
-    readonly_mode: bool = True           # safest default: SELECT only
-    auto_add_limit: bool = True          # automatically append LIMIT if missing
+    readonly_mode: bool = True
+    auto_add_limit: bool = True
     require_where_on_writes: bool = True
 
 
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
-_DDL        = re.compile(r"^\s*(CREATE|ALTER|DROP|TRUNCATE)\b", re.I)
-_DROP       = re.compile(r"^\s*DROP\b", re.I)
-_TRUNCATE   = re.compile(r"^\s*TRUNCATE\b", re.I)
-_DELETE     = re.compile(r"^\s*DELETE\b", re.I)
-_UPDATE     = re.compile(r"^\s*UPDATE\b", re.I)
-_INSERT     = re.compile(r"^\s*INSERT\b", re.I)
-_SELECT     = re.compile(r"^\s*SELECT\b", re.I)
-_WHERE      = re.compile(r"\bWHERE\b", re.I)
-_LIMIT      = re.compile(r"\bLIMIT\s+\d+", re.I)
-_SEMICOLON  = re.compile(r";.+", re.S)   # second statement — injection guard
-_COMMENT    = re.compile(r"(--[^\n]*|/\*.*?\*/)", re.S)
-_STAR_FROM  = re.compile(r"SELECT\s+\*", re.I)
-_EXPORT     = re.compile(r"\b(INTO\s+OUTFILE|BULK\s+INSERT|COPY\s+TO)\b", re.I)
+_DDL       = re.compile(r"^\s*(CREATE|ALTER|DROP|TRUNCATE)\b", re.I)
+_DROP      = re.compile(r"^\s*DROP\b", re.I)
+_TRUNCATE  = re.compile(r"^\s*TRUNCATE\b", re.I)
+_DELETE    = re.compile(r"^\s*DELETE\b", re.I)
+_UPDATE    = re.compile(r"^\s*UPDATE\b", re.I)
+_INSERT    = re.compile(r"^\s*INSERT\b", re.I)
+_SELECT    = re.compile(r"^\s*SELECT\b", re.I)
+_WHERE     = re.compile(r"\bWHERE\b", re.I)
+_LIMIT     = re.compile(r"\bLIMIT\s+\d+", re.I)
+_COMMENT   = re.compile(r"(--[^\n]*|/\*.*?\*/)", re.S)
+_STAR_FROM = re.compile(r"SELECT\s+\*", re.I)
+_EXPORT    = re.compile(r"\b(INTO\s+OUTFILE|BULK\s+INSERT|COPY\s+TO)\b", re.I)
 
 
 # ─── Main engine ──────────────────────────────────────────────────────────────
@@ -116,18 +114,21 @@ class GuardrailsEngine:
         Run all guardrail checks on *sql*.
         Returns a GuardrailResult — caller decides whether to proceed.
         """
+        # ── Injection guard: runs on RAW sql BEFORE comment stripping ─────
+        # Must be first. "SELECT 1; -- DROP TABLE users" contains a real
+        # semicolon that would be hidden if we stripped comments first.
+        raw_hash = hashlib.sha256(sql.encode()).hexdigest()[:12]
+        if self._has_multiple_statements(sql):
+            return GuardrailResult(
+                allowed=False, risk=RiskLevel.BLOCKED,
+                reason="Multi-statement queries are not allowed (SQL injection guard).",
+                query_hash=raw_hash,
+            )
+
         clean = self._strip_comments(sql).strip()
         query_hash = hashlib.sha256(clean.encode()).hexdigest()[:12]
         warnings: list[str] = []
         rewritten = clean
-
-        # ── Injection guard ────────────────────────────────────────────────
-        if self._has_multiple_statements(clean):
-            return GuardrailResult(
-                allowed=False, risk=RiskLevel.BLOCKED,
-                reason="Multi-statement queries are not allowed (SQL injection guard).",
-                query_hash=query_hash,
-            )
 
         # ── Export guard ───────────────────────────────────────────────────
         if _EXPORT.search(clean):
@@ -264,6 +265,10 @@ class GuardrailsEngine:
         return _COMMENT.sub(" ", sql)
 
     def _has_multiple_statements(self, sql: str) -> bool:
-        """Detect statement stacking — crude but effective for most injection attempts."""
+        """
+        Detect statement stacking on RAW (pre-comment-strip) sql.
+        Catches: 'SELECT 1; -- DROP TABLE users'
+        The semicolon is real even though what follows is a comment.
+        """
         stripped = sql.strip().rstrip(";")
         return bool(re.search(r";", stripped))

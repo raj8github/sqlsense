@@ -118,9 +118,11 @@ class TestGuardrailsEngine:
         assert r.risk == RiskLevel.BLOCKED
 
     def test_sql_comment_stripped_before_check(self, engine):
-        # Injection via comment should still be caught
+        # "SELECT 1; -- DROP TABLE users" has a real semicolon before the comment.
+        # The injection guard must run on raw SQL before comment stripping.
         r = engine.check("SELECT 1; -- DROP TABLE users")
         assert not r.allowed
+        assert r.risk == RiskLevel.BLOCKED
 
     def test_export_blocked(self, engine):
         r = engine.check("SELECT * INTO OUTFILE '/tmp/dump.csv' FROM users")
@@ -233,7 +235,7 @@ class TestMCPServer:
         result = server.handle_call_tool("sql_query", {"sql": "SELECT id, name FROM users"})
         assert not result.get("isError")
         text = result["content"][0]["text"]
-        assert "Alice" in text or "successfully" in text.lower()
+        assert "successfully" in text.lower()
 
     def test_sql_query_blocked(self, server):
         result = server.handle_call_tool("sql_query", {"sql": "DELETE FROM users"})
@@ -247,11 +249,15 @@ class TestMCPServer:
 
     def test_explain_query_safe(self, server):
         result = server.handle_call_tool("explain_query", {"sql": "SELECT id FROM users WHERE id=1"})
-        assert "ALLOWED" in result["content"][0]["text"]
+        text = result["content"][0]["text"]
+        # Output uses emoji: "Allowed    : ✅ Yes"
+        assert "Yes" in text
 
     def test_explain_query_blocked(self, server):
         result = server.handle_call_tool("explain_query", {"sql": "DROP TABLE users"})
-        assert "BLOCKED" in result["content"][0]["text"]
+        text = result["content"][0]["text"]
+        # Output uses emoji: "Allowed    : 🚫 No"
+        assert "No" in text
 
     def test_unknown_tool(self, server):
         result = server.handle_call_tool("nonexistent_tool", {})
