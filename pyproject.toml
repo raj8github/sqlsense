@@ -40,10 +40,10 @@ dev        = ["pytest>=7", "pytest-cov", "ruff", "mypy"]
 sqlsense = "sqlsense.cli:main"
 
 [project.urls]
-Homepage   = "https://github.com/yourusername/sqlsense"
-Repository = "https://github.com/yourusername/sqlsense"
-Issues     = "https://github.com/yourusername/sqlsense/issues"
-Docs       = "https://github.com/yourusername/sqlsense#readme"
+Homepage   = "https://github.com/raj8github/sqlsense"
+Repository = "https://github.com/raj8github/sqlsense"
+Issues     = "https://github.com/raj8github/sqlsense/issues"
+Docs       = "https://github.com/raj8github/sqlsense#readme"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
