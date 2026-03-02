@@ -10,9 +10,9 @@ sqlsense serve --dsn "postgresql://user:pass@localhost/mydb"
 ```
 
 [![PyPI version](https://img.shields.io/pypi/v/sqlsense.svg)](https://pypi.org/project/sqlsense/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://github.com/raj8github/sqlsense/actions/workflows/test.yml/badge.svg)](https://github.com/raj8github/sqlsense/actions)
+[![Downloads](https://img.shields.io/pypi/dm/sqlsense.svg)](https://pypi.org/project/sqlsense/)
 
 ---
 
@@ -63,6 +63,28 @@ pip install "sqlsense[snowflake]"   # Snowflake
 pip install "sqlsense[all]"         # Everything
 ```
 
+#### SQL Server — extra step required
+
+`pyodbc` (installed by `sqlsense[sqlserver]`) needs the **Microsoft ODBC Driver 17** installed at the OS level. `pip` cannot do this part.
+
+**macOS:**
+```bash
+brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
+brew update
+HOMEBREW_ACCEPT_EULA=Y brew install msodbcsql17
+```
+
+**Ubuntu / Debian:**
+```bash
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list \
+  | sudo tee /etc/apt/sources.list.d/mssql-release.list
+sudo apt-get update
+sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17
+```
+
+**Windows:** Download from [Microsoft's ODBC Driver page](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server) and run the installer.
+
 ### Start the MCP server
 
 ```bash
@@ -104,6 +126,89 @@ SQLSense intercepts every query, checks it against guardrails, logs it, and eith
 ```bash
 # In your project
 claude mcp add sqlsense -- sqlsense serve --dsn "postgresql://..."
+```
+
+---
+
+## Credentials — never hardcode them
+
+Never put database credentials directly in your MCP config or shell history. Use one of these patterns instead.
+
+### Option 1 — Wrapper script (recommended)
+
+Create a script that pulls credentials from your secret store at runtime:
+
+```bash
+# ~/scripts/sqlsense-mydb.sh
+#!/bin/bash
+sqlsense serve \
+  --dsn "postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:5432/${DB_NAME}" \
+  --max-rows 1000 \
+  --audit-log ~/.sqlsense/audit.jsonl
+```
+
+```bash
+chmod +x ~/scripts/sqlsense-mydb.sh
+```
+
+Then your Claude Desktop config stays clean — no credentials anywhere:
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "/Users/you/scripts/sqlsense-mydb.sh"
+    }
+  }
+}
+```
+
+### Option 2 — macOS Keychain
+
+```bash
+# Store once
+security add-generic-password -a sqlsense -s db-password -w "your_password"
+
+# Retrieve in your wrapper script
+DB_PASS=$(security find-generic-password -a sqlsense -s db-password -w)
+```
+
+### Option 3 — Environment variables via `env` block
+
+Claude Desktop supports an `env` block in the config — credentials stay out of `args`:
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "sqlsense",
+      "args": ["serve", "--dsn", "postgresql://$(DB_USER):$(DB_PASS)@$(DB_HOST)/$(DB_NAME)"],
+      "env": {
+        "DB_USER": "myuser",
+        "DB_PASS": "mypassword",
+        "DB_HOST": "localhost",
+        "DB_NAME": "mydb"
+      }
+    }
+  }
+}
+```
+
+### Option 4 — `.env` file with a loader
+
+```bash
+# .env (never commit this)
+DB_USER=myuser
+DB_PASS=mypassword
+DB_HOST=localhost
+DB_NAME=mydb
+```
+
+```bash
+# wrapper script
+#!/bin/bash
+set -a && source ~/.sqlsense/.env && set +a
+sqlsense serve --dsn "postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}/${DB_NAME}"
 ```
 
 ---
@@ -287,7 +392,7 @@ Contributions very welcome. The most useful things right now:
 4. **Tests** — more edge cases in `tests/test_sqlsense.py`
 
 ```bash
-git clone https://github.com/yourusername/sqlsense
+git clone https://github.com/raj8github/sqlsense
 cd sqlsense
 pip install -e ".[dev]"
 pytest tests/ -v
