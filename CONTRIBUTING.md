@@ -5,7 +5,7 @@ Thanks for wanting to contribute! SQLSense is a focused project with a clear sco
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/sqlsense
+git clone https://github.com/raj8github/sqlsense
 cd sqlsense
 pip install -e ".[dev]"
 pytest tests/ -v
