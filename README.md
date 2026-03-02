@@ -12,7 +12,7 @@ sqlsense serve --dsn "postgresql://user:pass@localhost/mydb"
 [![PyPI version](https://img.shields.io/pypi/v/sqlsense.svg)](https://pypi.org/project/sqlsense/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://github.com/yourusername/sqlsense/actions/workflows/test.yml/badge.svg)](https://github.com/yourusername/sqlsense/actions)
+[![Tests](https://github.com/raj8github/sqlsense/actions/workflows/test.yml/badge.svg)](https://github.com/raj8github/sqlsense/actions)
 
 ---
 
