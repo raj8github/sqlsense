@@ -126,7 +126,7 @@ class SQLSenseMCPServer:
             "protocolVersion": "2024-11-05",
             "serverInfo": {
                 "name": "sqlsense",
-                "version": "0.1.3",
+                "version": "4",
                 "description": f"Safe, audited SQL for AI agents — connected to {self.db_name}",
             },
             "capabilities": {
