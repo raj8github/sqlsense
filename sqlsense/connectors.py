@@ -10,11 +10,12 @@ where the driver supports it, and always enforced at guardrails level).
 
 from __future__ import annotations
 
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Optional
+from urllib.parse import unquote, urlparse
 
 
 @dataclass
@@ -23,7 +24,7 @@ class QueryResult:
     rows: list[dict]
     row_count: int
     duration_ms: float
-    truncated: bool = False   # True if LIMIT was hit
+    truncated: bool = False
 
 
 class BaseConnector(ABC):
@@ -45,12 +46,69 @@ class BaseConnector(ABC):
         ...
 
 
+# ─── DSN parser ───────────────────────────────────────────────────────────────
+
+def _parse_dsn(dsn: str) -> dict:
+    """
+    Safely parse a DSN that may contain special characters in the password
+    (e.g. @, :, #, !, /).
+
+    Handles both:
+      scheme://user:pass@host:port/database
+      scheme://user:pass@host/database        (no port)
+
+    Returns dict with keys: scheme, user, password, host, port, database
+    All values are URL-decoded so % escapes are resolved.
+    """
+    if "://" not in dsn:
+        raise ValueError(f"Invalid DSN — must include scheme, e.g. mssql://user:pass@host/db")
+
+    scheme, rest = dsn.split("://", 1)
+
+    # Split user:pass from host:port/db
+    # The last @ is the host separator — everything before is credentials
+    if "@" not in rest:
+        raise ValueError(f"DSN missing @ separator between credentials and host: {dsn}")
+
+    at_pos = rest.rfind("@")
+    credentials = rest[:at_pos]
+    hostpart    = rest[at_pos + 1:]
+
+    # Split credentials — only split on first colon
+    if ":" in credentials:
+        user, password = credentials.split(":", 1)
+    else:
+        user, password = credentials, ""
+
+    # Split host:port/database
+    if "/" in hostpart:
+        host_port, database = hostpart.split("/", 1)
+    else:
+        host_port, database = hostpart, ""
+
+    if ":" in host_port:
+        host, port_str = host_port.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            host, port = host_port, None
+    else:
+        host, port = host_port, None
+
+    return {
+        "scheme":   scheme.lower(),
+        "user":     unquote(user),
+        "password": unquote(password),
+        "host":     host,
+        "port":     port,
+        "database": database,
+    }
+
+
 # ─── SQLite ───────────────────────────────────────────────────────────────────
 
 class SQLiteConnector(BaseConnector):
-    """
-    Great for local dev and testing. Zero dependencies.
-    """
+    """Zero dependencies. Great for local dev and testing."""
 
     def __init__(self, db_path: str = ":memory:"):
         import sqlite3
@@ -63,14 +121,11 @@ class SQLiteConnector(BaseConnector):
         cur.execute(sql, params or {})
         raw_rows = cur.fetchall()
         duration_ms = (time.perf_counter() - t0) * 1000
-
         columns = [d[0] for d in (cur.description or [])]
         rows = [dict(zip(columns, row)) for row in raw_rows]
         return QueryResult(
-            columns=columns,
-            rows=rows,
-            row_count=len(rows),
-            duration_ms=round(duration_ms, 2),
+            columns=columns, rows=rows,
+            row_count=len(rows), duration_ms=round(duration_ms, 2),
         )
 
     def get_schema(self, table: Optional[str] = None) -> dict:
@@ -104,7 +159,8 @@ class SQLiteConnector(BaseConnector):
 class PostgreSQLConnector(BaseConnector):
     """
     Requires: pip install psycopg2-binary
-    Connection string: postgresql://user:pass@host:5432/dbname
+    DSN: postgresql://user:pass@host:5432/dbname
+    Passwords with special characters are handled automatically.
     """
 
     def __init__(self, dsn: str, readonly: bool = True):
@@ -114,7 +170,14 @@ class PostgreSQLConnector(BaseConnector):
         except ImportError:
             raise ImportError("Install psycopg2: pip install psycopg2-binary")
 
-        self._conn = psycopg2.connect(dsn)
+        p = _parse_dsn(dsn)
+        self._conn = psycopg2.connect(
+            host=p["host"],
+            port=p["port"] or 5432,
+            dbname=p["database"],
+            user=p["user"],
+            password=p["password"],
+        )
         if readonly:
             self._conn.set_session(readonly=True, autocommit=True)
         self._extras = psycopg2.extras
@@ -127,8 +190,8 @@ class PostgreSQLConnector(BaseConnector):
             duration_ms = (time.perf_counter() - t0) * 1000
             columns = list(raw[0].keys()) if raw else []
             rows = [dict(r) for r in raw]
-        return QueryResult(columns=columns, rows=rows, row_count=len(rows),
-                           duration_ms=round(duration_ms, 2))
+        return QueryResult(columns=columns, rows=rows,
+                           row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
         filter_clause = f"AND table_name = '{table}'" if table else ""
@@ -165,26 +228,37 @@ class PostgreSQLConnector(BaseConnector):
 class SQLServerConnector(BaseConnector):
     """
     Requires: pip install pyodbc
-    DSN format: mssql://user:pass@host:1433/database
+    DSN: mssql://user:pass@host:1433/database
 
-    This is the connector that matters most at Zip-scale environments.
+    Passwords with special characters (@, :, #, !, /) are handled correctly —
+    the DSN is parsed manually rather than via urlparse which breaks on them.
     """
 
     def __init__(self, dsn: str, readonly: bool = True):
         try:
             import pyodbc
         except ImportError:
-            raise ImportError("Install pyodbc: pip install pyodbc")
+            raise ImportError(
+                "Install pyodbc: pip install pyodbc\n"
+                "Also requires ODBC Driver 17 for SQL Server — "
+                "see https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server"
+            )
 
-        parsed = urlparse(dsn)
-        conn_str = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={parsed.hostname},{parsed.port or 1433};"
-            f"DATABASE={parsed.path.lstrip('/')};"
-            f"UID={parsed.username};"
-            f"PWD={parsed.password};"
-            "ApplicationIntent=ReadOnly;" if readonly else ""
-        )
+        p = _parse_dsn(dsn)
+
+        # Build pyodbc connection string — password passed directly, no URL encoding needed
+        conn_parts = [
+            "DRIVER={ODBC Driver 17 for SQL Server}",
+            f"SERVER={p['host']},{p['port'] or 1433}",
+            f"DATABASE={p['database']}",
+            f"UID={p['user']}",
+            f"PWD={p['password']}",
+        ]
+        if readonly:
+            conn_parts.append("ApplicationIntent=ReadOnly")
+
+        conn_str = ";".join(conn_parts)
+
         import pyodbc
         self._conn = pyodbc.connect(conn_str)
         self._readonly = readonly
@@ -196,8 +270,8 @@ class SQLServerConnector(BaseConnector):
         columns = [col[0] for col in (cur.description or [])]
         rows = [dict(zip(columns, row)) for row in cur.fetchall()]
         duration_ms = (time.perf_counter() - t0) * 1000
-        return QueryResult(columns=columns, rows=rows, row_count=len(rows),
-                           duration_ms=round(duration_ms, 2))
+        return QueryResult(columns=columns, rows=rows,
+                           row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
         filter_clause = f"AND t.name = '{table}'" if table else ""
@@ -237,32 +311,63 @@ class SQLServerConnector(BaseConnector):
 class SnowflakeConnector(BaseConnector):
     """
     Requires: pip install snowflake-connector-python
+    DSN: snowflake://user:pass@account/warehouse/database
+         snowflake://user:pass@account/warehouse/database?schema=MY_SCHEMA&role=MY_ROLE
+
+    Passwords with special characters are handled correctly.
     """
 
-    def __init__(self, account: str, user: str, password: str,
-                 warehouse: str, database: str, schema: str = "PUBLIC",
-                 role: Optional[str] = None):
+    def __init__(self, dsn: str, readonly: bool = True):
         try:
             import snowflake.connector
         except ImportError:
-            raise ImportError("Install snowflake connector: pip install snowflake-connector-python")
+            raise ImportError("Install: pip install snowflake-connector-python")
+
+        p = _parse_dsn(dsn)
+
+        # Snowflake DSN path is: /warehouse/database[?schema=X&role=Y]
+        # Split out any query params
+        db_path = p["database"]
+        schema = "PUBLIC"
+        role = None
+
+        if "?" in db_path:
+            db_path, query_str = db_path.split("?", 1)
+            for part in query_str.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    if k.lower() == "schema":
+                        schema = v
+                    elif k.lower() == "role":
+                        role = v
+
+        path_parts = db_path.strip("/").split("/")
+        warehouse = path_parts[0] if len(path_parts) > 0 else ""
+        database  = path_parts[1] if len(path_parts) > 1 else ""
 
         import snowflake.connector
-        self._conn = snowflake.connector.connect(
-            account=account, user=user, password=password,
-            warehouse=warehouse, database=database, schema=schema,
-            role=role or "PUBLIC",
+        connect_kwargs = dict(
+            account=p["host"],
+            user=p["user"],
+            password=p["password"],
+            warehouse=warehouse,
+            database=database,
+            schema=schema,
         )
+        if role:
+            connect_kwargs["role"] = role
+
+        self._conn = snowflake.connector.connect(**connect_kwargs)
 
     def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
         t0 = time.perf_counter()
-        cur = self._conn.cursor(self._conn.cursor().__class__)
+        cur = self._conn.cursor()
         cur.execute(sql)
         columns = [col[0] for col in (cur.description or [])]
         rows = [dict(zip(columns, row)) for row in cur.fetchall()]
         duration_ms = (time.perf_counter() - t0) * 1000
-        return QueryResult(columns=columns, rows=rows, row_count=len(rows),
-                           duration_ms=round(duration_ms, 2))
+        return QueryResult(columns=columns, rows=rows,
+                           row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
         sql = "SHOW COLUMNS" + (f" IN TABLE {table}" if table else " IN DATABASE")
@@ -293,13 +398,25 @@ def create_connector(dsn: str, **kwargs) -> BaseConnector:
     """
     Auto-detect connector from DSN scheme.
 
+    Handles passwords with special characters (@, :, #, !, /) correctly.
+    The last @ in the DSN is always treated as the host separator.
+
     Examples
     --------
     create_connector("sqlite:///./dev.db")
-    create_connector("postgresql://user:pass@localhost/mydb")
-    create_connector("mssql://user:pass@server:1433/mydb")
+    create_connector("postgresql://user:p%40ss@localhost/mydb")
+    create_connector("mssql://user:p@ss#1@server:1433/mydb")
+    create_connector("snowflake://user:pass@account/warehouse/database")
+    create_connector("snowflake://user:pass@account/warehouse/database?schema=RAW&role=ANALYST")
     """
-    scheme = urlparse(dsn).scheme.lower()
+    if "://" not in dsn:
+        raise ValueError(
+            f"Invalid DSN '{dsn}' — must include scheme.\n"
+            "Examples: mssql://user:pass@host:1433/db  |  postgresql://user:pass@host/db"
+        )
+
+    scheme = dsn.split("://")[0].lower()
+
     if scheme in ("sqlite", "sqlite3"):
         path = dsn.split("///", 1)[-1]
         return SQLiteConnector(path)
@@ -307,9 +424,10 @@ def create_connector(dsn: str, **kwargs) -> BaseConnector:
         return PostgreSQLConnector(dsn, **kwargs)
     elif scheme in ("mssql", "sqlserver"):
         return SQLServerConnector(dsn, **kwargs)
+    elif scheme == "snowflake":
+        return SnowflakeConnector(dsn, **kwargs)
     else:
         raise ValueError(
-            f"Unknown DSN scheme '{scheme}'. "
-            "Supported: sqlite, postgresql, mssql.\n"
-            "For Snowflake, use SnowflakeConnector() directly."
+            f"Unknown DSN scheme '{scheme}'.\n"
+            "Supported: sqlite, postgresql, mssql, snowflake."
         )
