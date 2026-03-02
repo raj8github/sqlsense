@@ -1,25 +1,25 @@
 """
-SQLSense — Zip internal configuration
+SQLSense — Sample internal configuration
 --------------------------------------
-Pre-tuned guardrail settings for Zip's SQL Server and Snowflake environments.
+Pre-tuned guardrail settings for Sample SQL Server and Snowflake environments.
 
 Usage
 -----
-from sqlsense.zip_config import zip_sqlserver_config, zip_snowflake_config
+from sqlsense.Sample_config import Sample_sqlserver_config, Sample_snowflake_config
 from sqlsense.server import SQLSenseMCPServer
 
-server = SQLSenseMCPServer(dsn=DSN, config=zip_snowflake_config())
+server = SQLSenseMCPServer(dsn=DSN, config=Sample_snowflake_config())
 """
 
 from sqlsense.guardrails import GuardrailConfig
 
 # ── Tables that agents must never touch ───────────────────────────────────────
-ZIP_BLOCKED_TABLES = [
+Sample_BLOCKED_TABLES = [
     # Auth / secrets
     "user_passwords",
     "api_keys",
     "oauth_tokens",
-    "zip_internal_config",
+    "Sample_internal_config",
     # Payment sensitive
     "payment_tokens",
     "card_vault",
@@ -30,7 +30,7 @@ ZIP_BLOCKED_TABLES = [
 ]
 
 # ── Columns that agents must never read ───────────────────────────────────────
-ZIP_BLOCKED_COLUMNS = [
+Sample_BLOCKED_COLUMNS = [
     # Auth
     "password", "password_hash", "hashed_password",
     "token", "access_token", "refresh_token",
@@ -46,7 +46,7 @@ ZIP_BLOCKED_COLUMNS = [
 ]
 
 
-def zip_sqlserver_config(max_rows: int = 2000) -> GuardrailConfig:
+def Sample_sqlserver_config(max_rows: int = 2000) -> GuardrailConfig:
     """
     Conservative config for SQL Server (operational / CDC source data).
     Agents get read access with strict guardrails.
@@ -56,8 +56,8 @@ def zip_sqlserver_config(max_rows: int = 2000) -> GuardrailConfig:
         readonly_mode=True,
         auto_add_limit=True,
         require_where_on_writes=True,
-        blocked_tables=ZIP_BLOCKED_TABLES,
-        blocked_columns=ZIP_BLOCKED_COLUMNS,
+        blocked_tables=Sample_BLOCKED_TABLES,
+        blocked_columns=Sample_BLOCKED_COLUMNS,
         allow_ddl=False,
         allow_delete=False,
         allow_update=False,
@@ -65,7 +65,7 @@ def zip_sqlserver_config(max_rows: int = 2000) -> GuardrailConfig:
     )
 
 
-def zip_snowflake_config(max_rows: int = 5000) -> GuardrailConfig:
+def Sample_snowflake_config(max_rows: int = 5000) -> GuardrailConfig:
     """
     Config for Snowflake (analytics / BI layer).
     Slightly higher row limit since Snowflake handles large scans better.
@@ -75,8 +75,8 @@ def zip_snowflake_config(max_rows: int = 5000) -> GuardrailConfig:
         readonly_mode=True,
         auto_add_limit=True,
         require_where_on_writes=True,
-        blocked_tables=ZIP_BLOCKED_TABLES,
-        blocked_columns=ZIP_BLOCKED_COLUMNS,
+        blocked_tables=Sample_BLOCKED_TABLES,
+        blocked_columns=Sample_BLOCKED_COLUMNS,
         allow_ddl=False,
         allow_delete=False,
         allow_update=False,
