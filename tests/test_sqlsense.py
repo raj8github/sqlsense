@@ -4,12 +4,16 @@ SQLSense Test Suite
 Run with: pytest tests/ -v
 """
 
+import json
+import os
+import tempfile
+
 import pytest
-from sqlsense.guardrails import GuardrailsEngine, GuardrailConfig, RiskLevel
-from sqlsense.connectors import SQLiteConnector
+
 from sqlsense.audit import AuditLogger
+from sqlsense.connectors import SQLiteConnector
+from sqlsense.guardrails import GuardrailsEngine, GuardrailConfig, RiskLevel
 from sqlsense.server import SQLSenseMCPServer
-import tempfile, os
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -268,3 +272,169 @@ class TestMCPServer:
         server.handle_call_tool("sql_query", {"sql": "SELECT 1"})
         result = server.handle_call_tool("get_audit_log", {"limit": 5})
         assert not result.get("isError")
+
+    def test_get_schema_invalid_table_raises(self, server):
+        # Invalid table name (SQL injection attempt) must not be passed to DB
+        from sqlsense.connectors import _safe_identifier
+        assert not _safe_identifier("users; DROP TABLE users--")
+        assert not _safe_identifier("")
+        assert _safe_identifier("users")
+        assert _safe_identifier("my_table")
+
+
+# ─── DuckDB Connector Tests ───────────────────────────────────────────────────
+
+class TestDuckDBConnector:
+    @pytest.fixture
+    def duckdb_connector(self):
+        try:
+            from sqlsense.connectors import DuckDBConnector
+        except ImportError:
+            pytest.skip("duckdb not installed")
+        return DuckDBConnector("duckdb://:memory:")
+
+    def test_duckdb_create_and_query(self, duckdb_connector):
+        from sqlsense.connectors import DuckDBConnector
+        db = DuckDBConnector("duckdb://:memory:")
+        db.execute("CREATE TABLE products (id INTEGER, name VARCHAR)")
+        db.execute("INSERT INTO products VALUES (1, 'Widget'), (2, 'Gadget')")
+        result = db.execute("SELECT * FROM products ORDER BY id")
+        assert result.row_count == 2
+        assert result.rows[0]["name"] == "Widget"
+        db.close()
+
+    def test_duckdb_get_schema(self, duckdb_connector):
+        duckdb_connector.execute("CREATE TABLE t1 (a INTEGER, b VARCHAR)")
+        schema = duckdb_connector.get_schema("t1")
+        assert "t1" in schema
+        col_names = [c["name"] for c in schema["t1"]]
+        assert "a" in col_names
+        assert "b" in col_names
+        duckdb_connector.close()
+
+    def test_duckdb_params(self):
+        try:
+            from sqlsense.connectors import DuckDBConnector
+        except ImportError:
+            pytest.skip("duckdb not installed")
+        db = DuckDBConnector("duckdb://:memory:")
+        db.execute("CREATE TABLE x (id INTEGER, val VARCHAR)")
+        db.execute("INSERT INTO x VALUES (1, 'a'), (2, 'b')")
+        result = db.execute("SELECT val FROM x WHERE id = %(id)s", {"id": 2})
+        assert result.row_count == 1
+        assert result.rows[0]["val"] == "b"
+        db.close()
+
+    def test_create_connector_duckdb(self):
+        from sqlsense.connectors import create_connector, DuckDBConnector
+        c = create_connector("duckdb://:memory:")
+        assert isinstance(c, DuckDBConnector)
+        assert c.test_connection()
+        c.close()
+
+
+# ─── Schema injection safety ──────────────────────────────────────────────────
+
+class TestSchemaInjectionSafety:
+    def test_sqlite_unsafe_table_raises(self, sqlite_db):
+        from sqlsense.connectors import SQLiteConnector
+        # sqlite_db is our fixture; get_schema with invalid name should raise
+        with pytest.raises(ValueError, match="Invalid or unsafe"):
+            sqlite_db.get_schema("users; DROP TABLE users--")
+
+
+# ─── Resource read respects blocked columns ────────────────────────────────────
+
+class TestResourceBlockedColumns:
+    def test_resource_read_excludes_blocked_columns(self, tmp_path):
+        from sqlsense.connectors import SQLiteConnector
+        from sqlsense.server import SQLSenseMCPServer
+        from sqlsense.guardrails import GuardrailConfig
+        db = SQLiteConnector(":memory:")
+        db.execute("CREATE TABLE accounts (id INT, name TEXT, password TEXT)")
+        db.execute("INSERT INTO accounts VALUES (1, 'alice', 'secret123')")
+        config = GuardrailConfig(blocked_columns=["password"])
+        server = SQLSenseMCPServer(
+            connector=db,
+            config=config,
+            audit_path=str(tmp_path / "audit.jsonl"),
+        )
+        result = server.handle_read_resource("db://database/accounts")
+        assert not result.get("contents", [{}])[0].get("isError")
+        text = result["contents"][0]["text"]
+        data = json.loads(text)
+        assert "sample_rows" in data
+        # Sample row must not contain 'password' key
+        for row in data["sample_rows"]:
+            assert "password" not in row
+            assert "id" in row
+            assert "name" in row
+        db.close()
+
+
+# ─── MySQL connector ─────────────────────────────────────────────────────────
+
+class TestMySQLConnector:
+    def test_create_connector_mysql(self):
+        pytest.importorskip("mysql.connector")
+        from sqlsense.connectors import create_connector, MySQLConnector
+        try:
+            c = create_connector("mysql://user:pass@localhost:3306/mydb")
+        except Exception as e:
+            # No MySQL server or connection refused — skip
+            pytest.skip(f"MySQL not available: {e}")
+        assert isinstance(c, MySQLConnector)
+        c.close()
+
+    def test_mysql_unsafe_table_raises(self):
+        pytest.importorskip("mysql.connector")
+        from sqlsense.connectors import MySQLConnector
+        try:
+            conn = MySQLConnector("mysql://root@127.0.0.1:3306/test")
+        except Exception:
+            pytest.skip("MySQL not available")
+        try:
+            with pytest.raises(ValueError, match="Invalid or unsafe"):
+                conn.get_schema("t; DROP TABLE t--")
+        finally:
+            conn.close()
+
+
+# ─── BigQuery connector ───────────────────────────────────────────────────────
+
+class TestBigQueryConnector:
+    def test_parse_bigquery_dsn(self):
+        from sqlsense.connectors import _parse_bigquery_dsn
+        p, d = _parse_bigquery_dsn("bigquery://my_project/my_dataset")
+        assert p == "my_project"
+        assert d == "my_dataset"
+        with pytest.raises(ValueError, match="project_id"):
+            _parse_bigquery_dsn("bigquery:///dataset")
+        with pytest.raises(ValueError, match="dataset_id"):
+            _parse_bigquery_dsn("bigquery://proj/")
+
+    def test_create_connector_bigquery(self):
+        pytest.importorskip("google.cloud.bigquery")
+        from sqlsense.connectors import create_connector, BigQueryConnector
+        try:
+            c = create_connector("bigquery://my_project/my_dataset")
+        except Exception as e:
+            # No ADC / credentials — skip
+            pytest.skip(f"BigQuery credentials not available: {e}")
+        assert isinstance(c, BigQueryConnector)
+        assert c._project == "my_project"
+        assert c._dataset == "my_dataset"
+        c.close()
+
+    def test_bigquery_unsafe_table_raises(self):
+        pytest.importorskip("google.cloud.bigquery")
+        from sqlsense.connectors import BigQueryConnector
+        try:
+            conn = BigQueryConnector("bigquery://p/d")
+        except Exception:
+            pytest.skip("BigQuery client init failed (no credentials?)")
+        try:
+            with pytest.raises(ValueError, match="Invalid or unsafe"):
+                conn.get_schema("t; DROP TABLE t--")
+        finally:
+            conn.close()

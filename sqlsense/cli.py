@@ -15,16 +15,8 @@ import sys
 
 def _detect_dialect(dsn: str) -> str:
     """Auto-detect SQL dialect from DSN scheme."""
-    if "://" not in dsn:
-        return "standard"
-    scheme = dsn.split("://")[0].lower()
-    if scheme in ("mssql", "sqlserver"):
-        return "mssql"
-    elif scheme in ("postgresql", "postgres"):
-        return "postgres"
-    elif scheme == "snowflake":
-        return "snowflake"
-    return "standard"
+    from .connectors import get_dialect_from_dsn
+    return get_dialect_from_dsn(dsn)
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -46,7 +38,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         dialect=dialect,
     )
 
-    print(f"🛡️  SQLSense v0.1.2 starting...", file=sys.stderr)
+    from . import __version__
+    print(f"🛡️  SQLSense v{__version__} starting...", file=sys.stderr)
     print(f"   DSN        : {_mask_dsn(args.dsn)}", file=sys.stderr)
     print(f"   Mode       : {'read-write' if args.allow_writes else 'readonly'}", file=sys.stderr)
     print(f"   Max rows   : {args.max_rows}", file=sys.stderr)
@@ -59,6 +52,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         config=config,
         audit_path=args.audit_log,
         agent_id=args.agent_id,
+        schema_cache_ttl_sec=float(args.schema_cache_ttl),
     )
 
     if not server.db.test_connection():
@@ -159,6 +153,8 @@ def main() -> None:
                        help="Agent identifier for audit log")
     serve.add_argument("--dialect", choices=["standard", "mssql", "postgres", "snowflake"],
                        help="SQL dialect (auto-detected from DSN if not set)")
+    serve.add_argument("--schema-cache-ttl", type=int, default=300, metavar="SEC",
+                       help="Schema cache TTL in seconds (default: 300)")
     serve.set_defaults(func=cmd_serve)
 
     # ── check ──────────────────────────────────────────────────────────────
