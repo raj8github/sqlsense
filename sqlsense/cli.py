@@ -45,7 +45,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     print(f"   Max rows   : {args.max_rows}", file=sys.stderr)
     print(f"   Dialect    : {dialect}", file=sys.stderr)
     print(f"   Audit log  : {args.audit_log}", file=sys.stderr)
-    print(f"", file=sys.stderr)
+    print("", file=sys.stderr)
 
     server = SQLSenseMCPServer(
         dsn=args.dsn,

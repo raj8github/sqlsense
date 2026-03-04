@@ -5,8 +5,6 @@ Run with: pytest tests/ -v
 """
 
 import json
-import os
-import tempfile
 
 import pytest
 
@@ -287,10 +285,8 @@ class TestMCPServer:
 class TestDuckDBConnector:
     @pytest.fixture
     def duckdb_connector(self):
-        try:
-            from sqlsense.connectors import DuckDBConnector
-        except ImportError:
-            pytest.skip("duckdb not installed")
+        pytest.importorskip("duckdb")
+        from sqlsense.connectors import DuckDBConnector
         return DuckDBConnector("duckdb://:memory:")
 
     def test_duckdb_create_and_query(self, duckdb_connector):
@@ -313,10 +309,8 @@ class TestDuckDBConnector:
         duckdb_connector.close()
 
     def test_duckdb_params(self):
-        try:
-            from sqlsense.connectors import DuckDBConnector
-        except ImportError:
-            pytest.skip("duckdb not installed")
+        pytest.importorskip("duckdb")
+        from sqlsense.connectors import DuckDBConnector
         db = DuckDBConnector("duckdb://:memory:")
         db.execute("CREATE TABLE x (id INTEGER, val VARCHAR)")
         db.execute("INSERT INTO x VALUES (1, 'a'), (2, 'b')")
@@ -326,6 +320,7 @@ class TestDuckDBConnector:
         db.close()
 
     def test_create_connector_duckdb(self):
+        pytest.importorskip("duckdb")
         from sqlsense.connectors import create_connector, DuckDBConnector
         c = create_connector("duckdb://:memory:")
         assert isinstance(c, DuckDBConnector)
@@ -337,7 +332,6 @@ class TestDuckDBConnector:
 
 class TestSchemaInjectionSafety:
     def test_sqlite_unsafe_table_raises(self, sqlite_db):
-        from sqlsense.connectors import SQLiteConnector
         # sqlite_db is our fixture; get_schema with invalid name should raise
         with pytest.raises(ValueError, match="Invalid or unsafe"):
             sqlite_db.get_schema("users; DROP TABLE users--")
