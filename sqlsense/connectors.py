@@ -2,7 +2,7 @@
 SQLSense Database Connector
 ----------------------------
 Thin connection layer that routes to the right driver.
-Supported: SQLite (built-in), PostgreSQL, SQL Server, Snowflake.
+Supported: SQLite (built-in), PostgreSQL, MySQL, SQL Server, Snowflake, DuckDB, BigQuery.
 
 All connections are read-only by default (enforced at connection level
 where the driver supports it, and always enforced at guardrails level).
@@ -16,6 +16,50 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import unquote, urlparse
+
+
+def _safe_identifier(name: str) -> bool:
+    """Allow only alphanumeric and underscore; optionally schema.table (one dot)."""
+    if not name or not name.strip():
+        return False
+    # Allow schema.table
+    parts = name.strip().split(".")
+    if len(parts) > 2:
+        return False
+    for part in parts:
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", part.strip()):
+            return False
+    return True
+
+
+def get_dialect_from_dsn(dsn: str) -> str:
+    """Auto-detect SQL dialect from DSN scheme."""
+    if "://" not in dsn:
+        return "standard"
+    scheme = dsn.split("://")[0].lower()
+    if scheme in ("mssql", "sqlserver"):
+        return "mssql"
+    if scheme in ("postgresql", "postgres"):
+        return "postgres"
+    if scheme == "snowflake":
+        return "snowflake"
+    if scheme in ("duckdb", "mysql", "bigquery"):
+        return "standard"  # LIMIT syntax
+    return "standard"
+
+
+def _named_params_to_positional(sql: str, params: dict) -> tuple[str, list]:
+    """Convert %(name)s placeholders and dict to ? and ordered list for pyodbc-style drivers."""
+    order: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"%\((\w+)\)s", sql):
+        k = m.group(1)
+        if k not in seen:
+            order.append(k)
+            seen.add(k)
+    values = [params[k] for k in order if k in params]
+    new_sql = re.sub(r"%\(\w+\)s", "?", sql)
+    return new_sql, values
 
 
 @dataclass
@@ -131,7 +175,9 @@ class SQLiteConnector(BaseConnector):
     def get_schema(self, table: Optional[str] = None) -> dict:
         cur = self._conn.cursor()
         if table:
-            cur.execute(f"PRAGMA table_info({table})")
+            if not _safe_identifier(table):
+                raise ValueError(f"Invalid or unsafe table name: {table!r}")
+            cur.execute(f'PRAGMA table_info("{table}")')
             cols = [{"name": r[1], "type": r[2], "notnull": bool(r[3]), "pk": bool(r[5])}
                     for r in cur.fetchall()]
             return {table: cols}
@@ -194,16 +240,108 @@ class PostgreSQLConnector(BaseConnector):
                            row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
-        filter_clause = f"AND table_name = '{table}'" if table else ""
-        sql = f"""
+        if table and not _safe_identifier(table):
+            raise ValueError(f"Invalid or unsafe table name: {table!r}")
+        sql = """
             SELECT table_name, column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_schema = 'public' {filter_clause}
-            ORDER BY table_name, ordinal_position
+            WHERE table_schema = 'public'
         """
-        result = self.execute(sql)
+        if table:
+            sql += " AND table_name = %s ORDER BY table_name, ordinal_position"
+            with self._conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute(sql, (table,))
+                raw = cur.fetchall()
+            rows = [dict(r) for r in raw]
+        else:
+            sql += " ORDER BY table_name, ordinal_position"
+            result = self.execute(sql)
+            rows = result.rows
         schema: dict = {}
-        for row in result.rows:
+        for row in rows:
+            t = row["table_name"]
+            schema.setdefault(t, []).append({
+                "name": row["column_name"],
+                "type": row["data_type"],
+                "nullable": row["is_nullable"] == "YES",
+            })
+        return schema
+
+    def test_connection(self) -> bool:
+        try:
+            self.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ─── MySQL ─────────────────────────────────────────────────────────────────────
+
+class MySQLConnector(BaseConnector):
+    """
+    Requires: pip install mysql-connector-python
+    DSN: mysql://user:pass@host:3306/dbname
+
+    Works with MySQL, MariaDB, AWS RDS/Aurora MySQL, Azure Database for MySQL.
+    """
+
+    def __init__(self, dsn: str, readonly: bool = True):
+        try:
+            import mysql.connector
+        except ImportError:
+            raise ImportError("Install: pip install mysql-connector-python")
+
+        p = _parse_dsn(dsn)
+        self._conn = mysql.connector.connect(
+            host=p["host"],
+            port=p["port"] or 3306,
+            database=p["database"],
+            user=p["user"],
+            password=p["password"],
+        )
+        self._readonly = readonly
+
+    def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
+        t0 = time.perf_counter()
+        cur = self._conn.cursor(dictionary=True)
+        try:
+            cur.execute(sql, params or ())
+            rows = cur.fetchall()
+            columns = list(rows[0].keys()) if rows else []
+        finally:
+            cur.close()
+        duration_ms = (time.perf_counter() - t0) * 1000
+        return QueryResult(
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+            duration_ms=round(duration_ms, 2),
+        )
+
+    def get_schema(self, table: Optional[str] = None) -> dict:
+        if table and not _safe_identifier(table):
+            raise ValueError(f"Invalid or unsafe table name: {table!r}")
+        sql = """
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = %s
+        """
+        params: list = [self._conn.database]
+        if table:
+            sql += " AND table_name = %s"
+            params.append(table)
+        sql += " ORDER BY table_name, ordinal_position"
+        cur = self._conn.cursor(dictionary=True)
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        schema: dict = {}
+        for row in rows:
             t = row["table_name"]
             schema.setdefault(t, []).append({
                 "name": row["column_name"],
@@ -266,7 +404,11 @@ class SQLServerConnector(BaseConnector):
     def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
         t0 = time.perf_counter()
         cur = self._conn.cursor()
-        cur.execute(sql)
+        if params:
+            sql, positional = _named_params_to_positional(sql, params)
+            cur.execute(sql, positional)
+        else:
+            cur.execute(sql)
         columns = [col[0] for col in (cur.description or [])]
         rows = [dict(zip(columns, row)) for row in cur.fetchall()]
         duration_ms = (time.perf_counter() - t0) * 1000
@@ -274,19 +416,29 @@ class SQLServerConnector(BaseConnector):
                            row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
-        filter_clause = f"AND t.name = '{table}'" if table else ""
-        sql = f"""
+        if table and not _safe_identifier(table):
+            raise ValueError(f"Invalid or unsafe table name: {table!r}")
+        sql = """
             SELECT t.name AS table_name, c.name AS column_name,
                    tp.name AS data_type, c.is_nullable
             FROM sys.tables t
             JOIN sys.columns c ON t.object_id = c.object_id
             JOIN sys.types tp ON c.user_type_id = tp.user_type_id
-            WHERE t.is_ms_shipped = 0 {filter_clause}
-            ORDER BY t.name, c.column_id
+            WHERE t.is_ms_shipped = 0
         """
-        result = self.execute(sql)
+        if table:
+            sql += " AND t.name = ? ORDER BY t.name, c.column_id"
+            cur = self._conn.cursor()
+            cur.execute(sql, (table,))
+            raw = cur.fetchall()
+            columns = [col[0] for col in (cur.description or [])]
+            rows = [dict(zip(columns, row)) for row in raw]
+        else:
+            sql += " ORDER BY t.name, c.column_id"
+            result = self.execute(sql)
+            rows = result.rows
         schema: dict = {}
-        for row in result.rows:
+        for row in rows:
             t = row["table_name"]
             schema.setdefault(t, []).append({
                 "name": row["column_name"],
@@ -362,7 +514,11 @@ class SnowflakeConnector(BaseConnector):
     def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
         t0 = time.perf_counter()
         cur = self._conn.cursor()
-        cur.execute(sql)
+        if params:
+            sql, positional = _named_params_to_positional(sql, params)
+            cur.execute(sql, positional)
+        else:
+            cur.execute(sql)
         columns = [col[0] for col in (cur.description or [])]
         rows = [dict(zip(columns, row)) for row in cur.fetchall()]
         duration_ms = (time.perf_counter() - t0) * 1000
@@ -370,8 +526,12 @@ class SnowflakeConnector(BaseConnector):
                            row_count=len(rows), duration_ms=round(duration_ms, 2))
 
     def get_schema(self, table: Optional[str] = None) -> dict:
-        sql = "SHOW COLUMNS" + (f" IN TABLE {table}" if table else " IN DATABASE")
-        result = self.execute(sql)
+        if table:
+            if not _safe_identifier(table):
+                raise ValueError(f"Invalid or unsafe table name: {table!r}")
+            result = self.execute(f'SHOW COLUMNS IN TABLE "{table}"')
+        else:
+            result = self.execute("SHOW COLUMNS IN DATABASE")
         schema: dict = {}
         for row in result.rows:
             t = row.get("table_name", "unknown")
@@ -392,6 +552,195 @@ class SnowflakeConnector(BaseConnector):
         self._conn.close()
 
 
+# ─── DuckDB ───────────────────────────────────────────────────────────────────
+
+class DuckDBConnector(BaseConnector):
+    """
+    Requires: pip install duckdb
+    DSN: duckdb:///path/to/file.duckdb  or  duckdb://:memory:
+
+    Great for local analytics and Python-native workflows.
+    """
+
+    def __init__(self, dsn: str):
+        try:
+            import duckdb
+        except ImportError:
+            raise ImportError("Install duckdb: pip install duckdb")
+
+        if "://" not in dsn:
+            raise ValueError("DuckDB DSN must include scheme, e.g. duckdb:///file.duckdb")
+        rest = dsn.split("://", 1)[1].strip("/")
+        if not rest or rest == ":memory:":
+            path = ":memory:"
+        else:
+            path = rest
+        self._conn = duckdb.connect(path)
+
+    def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
+        t0 = time.perf_counter()
+        if params:
+            sql, positional = _named_params_to_positional(sql, params)
+            result = self._conn.execute(sql, positional)
+        else:
+            result = self._conn.execute(sql)
+        rows = result.fetchall()
+        columns = [d[0] for d in result.description] if result.description else []
+        duration_ms = (time.perf_counter() - t0) * 1000
+        rows_dict = [dict(zip(columns, row)) for row in rows]
+        return QueryResult(
+            columns=columns,
+            rows=rows_dict,
+            row_count=len(rows_dict),
+            duration_ms=round(duration_ms, 2),
+        )
+
+    def get_schema(self, table: Optional[str] = None) -> dict:
+        if table and not _safe_identifier(table):
+            raise ValueError(f"Invalid or unsafe table name: {table!r}")
+        if table:
+            result = self._conn.execute(
+                """
+                SELECT table_name, column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [table],
+            )
+        else:
+            result = self._conn.execute("""
+                SELECT table_name, column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'main'
+                ORDER BY table_name, ordinal_position
+            """)
+        rows = result.fetchall()
+        cols = [d[0] for d in result.description]
+        schema: dict = {}
+        for row in rows:
+            r = dict(zip(cols, row))
+            t = r["table_name"]
+            schema.setdefault(t, []).append({
+                "name": r["column_name"],
+                "type": r["data_type"],
+                "nullable": r["is_nullable"] == "YES",
+            })
+        return schema
+
+    def test_connection(self) -> bool:
+        try:
+            self._conn.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ─── BigQuery ──────────────────────────────────────────────────────────────────
+
+def _parse_bigquery_dsn(dsn: str) -> tuple[str, str]:
+    """Parse bigquery://project_id/dataset_id (no @). Auth via ADC / GOOGLE_APPLICATION_CREDENTIALS."""
+    if "://" not in dsn or not dsn.strip().lower().startswith("bigquery://"):
+        raise ValueError("BigQuery DSN must be: bigquery://project_id/dataset_id")
+    rest = dsn.split("://", 1)[1].strip().strip("/")
+    parts = rest.split("/", 1)
+    project = (parts[0] or "").strip()
+    dataset = (parts[1] if len(parts) > 1 else "").strip()
+    if not project:
+        raise ValueError("BigQuery DSN must include project_id: bigquery://project_id/dataset_id")
+    if not dataset:
+        raise ValueError("BigQuery DSN must include dataset_id: bigquery://project_id/dataset_id")
+    return project, dataset
+
+
+class BigQueryConnector(BaseConnector):
+    """
+    Requires: pip install google-cloud-bigquery
+    DSN: bigquery://project_id/dataset_id
+
+    Auth via Application Default Credentials (ADC) or GOOGLE_APPLICATION_CREDENTIALS.
+    No credentials in DSN.
+    """
+
+    def __init__(self, dsn: str):
+        try:
+            from google.cloud import bigquery
+        except ImportError:
+            raise ImportError("Install: pip install google-cloud-bigquery")
+
+        self._project, self._dataset = _parse_bigquery_dsn(dsn)
+        self._client = bigquery.Client(project=self._project)
+
+    def execute(self, sql: str, params: Optional[dict] = None) -> QueryResult:
+        from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
+
+        t0 = time.perf_counter()
+        job_config = None
+        if params:
+            _bq_types = {"str": "STRING", "int": "INT64", "float": "FLOAT64", "bool": "BOOL"}
+            job_params = [
+                ScalarQueryParameter(k, _bq_types.get(type(v).__name__, "STRING"), v)
+                for k, v in params.items()
+            ]
+            job_config = QueryJobConfig(query_parameters=job_params)
+        job = self._client.query(sql, job_config=job_config)
+        rows = list(job.result())
+        duration_ms = (time.perf_counter() - t0) * 1000
+        columns = [f.name for f in (job.schema or [])]
+        if rows and not columns:
+            columns = list(rows[0].keys()) if hasattr(rows[0], "keys") else []
+        rows_dict = [dict(row) for row in rows] if rows else []
+        return QueryResult(
+            columns=columns,
+            rows=rows_dict,
+            row_count=len(rows_dict),
+            duration_ms=round(duration_ms, 2),
+        )
+
+    def get_schema(self, table: Optional[str] = None) -> dict:
+        from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
+
+        if table and not _safe_identifier(table):
+            raise ValueError(f"Invalid or unsafe table name: {table!r}")
+        dataset_ref = f"`{self._project}.{self._dataset}`"
+        sql = f"""
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM {dataset_ref}.INFORMATION_SCHEMA.COLUMNS
+        """
+        if table:
+            sql += " WHERE table_name = @table_name"
+            job_config = QueryJobConfig(
+                query_parameters=[ScalarQueryParameter("table_name", "STRING", table)]
+            )
+            job = self._client.query(sql, job_config=job_config)
+        else:
+            job = self._client.query(sql)
+        rows = list(job.result())
+        schema: dict = {}
+        for row in rows:
+            r = dict(row)
+            t = r.get("table_name", "unknown")
+            schema.setdefault(t, []).append({
+                "name": r.get("column_name"),
+                "type": r.get("data_type"),
+                "nullable": (r.get("is_nullable") or "").upper() == "YES",
+            })
+        return schema
+
+    def test_connection(self) -> bool:
+        try:
+            self.execute("SELECT 1 AS x")
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        self._client.close()
+
+
 # ─── Factory ──────────────────────────────────────────────────────────────────
 
 def create_connector(dsn: str, **kwargs) -> BaseConnector:
@@ -406,8 +755,10 @@ def create_connector(dsn: str, **kwargs) -> BaseConnector:
     create_connector("sqlite:///./dev.db")
     create_connector("postgresql://user:p%40ss@localhost/mydb")
     create_connector("mssql://user:p@ss#1@server:1433/mydb")
+    create_connector("mysql://user:pass@host:3306/mydb")
     create_connector("snowflake://user:pass@account/warehouse/database")
-    create_connector("snowflake://user:pass@account/warehouse/database?schema=RAW&role=ANALYST")
+    create_connector("bigquery://project_id/dataset_id")
+    create_connector("duckdb:///path/to/file.duckdb")
     """
     if "://" not in dsn:
         raise ValueError(
@@ -422,12 +773,18 @@ def create_connector(dsn: str, **kwargs) -> BaseConnector:
         return SQLiteConnector(path)
     elif scheme in ("postgresql", "postgres"):
         return PostgreSQLConnector(dsn, **kwargs)
+    elif scheme == "mysql":
+        return MySQLConnector(dsn, **kwargs)
     elif scheme in ("mssql", "sqlserver"):
         return SQLServerConnector(dsn, **kwargs)
     elif scheme == "snowflake":
         return SnowflakeConnector(dsn, **kwargs)
+    elif scheme == "duckdb":
+        return DuckDBConnector(dsn)
+    elif scheme == "bigquery":
+        return BigQueryConnector(dsn)
     else:
         raise ValueError(
             f"Unknown DSN scheme '{scheme}'.\n"
-            "Supported: sqlite, postgresql, mssql, snowflake."
+            "Supported: sqlite, postgresql, mysql, mssql, snowflake, duckdb, bigquery."
         )

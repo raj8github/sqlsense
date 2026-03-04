@@ -45,7 +45,7 @@ SQLSense is an **MCP server** that wraps your database connection with:
 - 🔢 **Auto-LIMIT** — automatically caps SELECT queries to prevent full-table scans  
 - 🙈 **Column blocking** — blocklist sensitive columns (`password`, `ssn`, `api_key`...)  
 - 💉 **Injection guard** — multi-statement queries blocked at parse time  
-- 🗄️ **Multi-database** — SQLite, PostgreSQL, SQL Server, Snowflake
+- 🗄️ **Multi-database** — SQLite, PostgreSQL, MySQL, SQL Server, Snowflake, DuckDB, BigQuery
 
 ---
 
@@ -58,9 +58,12 @@ pip install sqlsense
 
 # With your database driver
 pip install "sqlsense[postgres]"    # PostgreSQL
+pip install "sqlsense[mysql]"       # MySQL / MariaDB (AWS RDS, Azure MySQL)
 pip install "sqlsense[sqlserver]"   # SQL Server
-pip install "sqlsense[snowflake]"   # Snowflake
-pip install "sqlsense[all]"         # Everything
+pip install "sqlsense[snowflake]"  # Snowflake
+pip install "sqlsense[duckdb]"     # DuckDB (local analytics, Python-native)
+pip install "sqlsense[bigquery]"   # Google BigQuery (auth via ADC)
+pip install "sqlsense[all]"        # Everything
 ```
 
 #### SQL Server — extra step required
@@ -94,11 +97,21 @@ sqlsense serve --dsn "postgresql://user:pass@localhost/mydb"
 # SQL Server (common in enterprise/fintech)
 sqlsense serve --dsn "mssql://user:pass@server:1433/mydb"
 
+# MySQL / MariaDB (AWS RDS, Aurora, Azure Database for MySQL)
+sqlsense serve --dsn "mysql://user:pass@host:3306/mydb"
+
 # Snowflake
 sqlsense serve --dsn "snowflake://user:pass@account/warehouse/database"
 
+# BigQuery (auth via GOOGLE_APPLICATION_CREDENTIALS or ADC)
+sqlsense serve --dsn "bigquery://my_project/my_dataset"
+
 # SQLite (great for local dev)
 sqlsense serve --dsn "sqlite:///./myapp.db"
+
+# DuckDB (local analytics, dbt-style workflows)
+sqlsense serve --dsn "duckdb:///./analytics.duckdb"
+# or in-memory: duckdb://:memory:
 ```
 
 ### Connect to Claude Desktop
@@ -320,11 +333,11 @@ The agent calls `get_schema` first to understand the database, then `explain_que
 |----------|--------|---------|
 | SQLite | ✅ Built-in | `pip install sqlsense` |
 | PostgreSQL | ✅ Stable | `pip install "sqlsense[postgres]"` |
+| MySQL / MariaDB | ✅ Stable | `pip install "sqlsense[mysql]"` |
 | SQL Server | ✅ Stable | `pip install "sqlsense[sqlserver]"` |
 | Snowflake | ✅ Stable | `pip install "sqlsense[snowflake]"` |
-| MySQL | 🚧 Planned | — |
-| BigQuery | 🚧 Planned | — |
-| DuckDB | 🚧 Planned | — |
+| DuckDB | ✅ Stable | `pip install "sqlsense[duckdb]"` |
+| BigQuery | ✅ Stable | `pip install "sqlsense[bigquery]"` |
 
 ---
 

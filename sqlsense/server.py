@@ -13,8 +13,9 @@ import time
 import traceback
 from typing import Optional
 
+from . import __version__
 from .audit import AuditLogger
-from .connectors import BaseConnector, QueryResult, create_connector
+from .connectors import BaseConnector, QueryResult, create_connector, get_dialect_from_dsn
 from .guardrails import GuardrailsEngine, GuardrailConfig
 
 
@@ -84,6 +85,7 @@ class SQLSenseMCPServer:
         audit_path: str = "./sqlsense_audit.jsonl",
         agent_id: Optional[str] = "sqlsense-agent",
         db_name: Optional[str] = None,
+        schema_cache_ttl_sec: float = 300,
     ):
         if connector:
             self.db = connector
@@ -92,10 +94,16 @@ class SQLSenseMCPServer:
         else:
             raise ValueError("Provide either dsn or connector.")
 
-        self.guardrails = GuardrailsEngine(config or GuardrailConfig())
+        if config is None and dsn:
+            config = GuardrailConfig(dialect=get_dialect_from_dsn(dsn))
+        elif config is None:
+            config = GuardrailConfig()
+        self.guardrails = GuardrailsEngine(config)
         self.audit = AuditLogger(audit_path, agent_id=agent_id)
         self.agent_id = agent_id
         self._schema_cache: Optional[dict] = None
+        self._schema_cache_ts: float = 0
+        self._schema_cache_ttl_sec = schema_cache_ttl_sec
 
         if db_name:
             self.db_name = db_name
@@ -115,8 +123,14 @@ class SQLSenseMCPServer:
     def _get_schema(self, table: Optional[str] = None) -> dict:
         if table:
             return self.db.get_schema(table)
-        if self._schema_cache is None:
-            self._schema_cache = self.db.get_schema()
+        now = time.time()
+        if (
+            self._schema_cache is not None
+            and (now - self._schema_cache_ts) < self._schema_cache_ttl_sec
+        ):
+            return self._schema_cache
+        self._schema_cache = self.db.get_schema()
+        self._schema_cache_ts = now
         return self._schema_cache
 
     # ── MCP handlers — initialize ─────────────────────────────────────────────
@@ -126,7 +140,7 @@ class SQLSenseMCPServer:
             "protocolVersion": "2024-11-05",
             "serverInfo": {
                 "name": "sqlsense",
-                "version": "4",
+                "version": __version__,
                 "description": f"Safe, audited SQL for AI agents — connected to {self.db_name}",
             },
             "capabilities": {
@@ -192,19 +206,26 @@ class SQLSenseMCPServer:
             schema = self._get_schema(table_name)
             columns = schema.get(table_name, [])
 
-            sample_sql = f"SELECT * FROM {table_name}"
-            guard = self.guardrails.check(sample_sql)
-            safe_sql = guard.rewritten_sql or sample_sql
+            blocked = {c.lower() for c in self.guardrails.config.blocked_columns}
+            allowed_cols = [c["name"] for c in columns if c["name"].lower() not in blocked]
+            if allowed_cols:
+                quoted = [f'"{c}"' for c in allowed_cols]
+                sample_sql = f"SELECT {', '.join(quoted)} FROM {table_name}"
+            else:
+                sample_sql = None
             rows = []
-            if guard.allowed:
-                try:
-                    result = self.db.execute(safe_sql)
-                    rows = result.rows[:20]
-                    self.audit.record(sample_sql, guard,
-                                      rows_returned=result.row_count,
-                                      duration_ms=result.duration_ms)
-                except Exception:
-                    pass
+            if sample_sql:
+                guard = self.guardrails.check(sample_sql)
+                safe_sql = guard.rewritten_sql or sample_sql
+                if guard.allowed:
+                    try:
+                        result = self.db.execute(safe_sql)
+                        rows = result.rows[:20]
+                        self.audit.record(sample_sql, guard,
+                                          rows_returned=result.row_count,
+                                          duration_ms=result.duration_ms)
+                    except Exception:
+                        pass
 
             content = {
                 "table": table_name,
