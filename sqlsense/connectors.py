@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 
 
 def _safe_identifier(name: str) -> bool:
@@ -105,7 +105,7 @@ def _parse_dsn(dsn: str) -> dict:
     All values are URL-decoded so % escapes are resolved.
     """
     if "://" not in dsn:
-        raise ValueError(f"Invalid DSN — must include scheme, e.g. mssql://user:pass@host/db")
+        raise ValueError("Invalid DSN — must include scheme, e.g. mssql://user:pass@host/db")
 
     scheme, rest = dsn.split("://", 1)
 

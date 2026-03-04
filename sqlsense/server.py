@@ -15,7 +15,7 @@ from typing import Optional
 
 from . import __version__
 from .audit import AuditLogger
-from .connectors import BaseConnector, QueryResult, create_connector, get_dialect_from_dsn
+from .connectors import BaseConnector, create_connector, get_dialect_from_dsn
 from .guardrails import GuardrailsEngine, GuardrailConfig
 
 
@@ -188,7 +188,7 @@ class SQLSenseMCPServer:
                     "mimeType": "application/json",
                 })
             return {"resources": resources}
-        except Exception as e:
+        except Exception:
             return {"resources": []}
 
     def handle_read_resource(self, uri: str) -> dict:
